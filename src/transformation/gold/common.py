@@ -55,14 +55,16 @@ def ensure_gold_namespace(catalog) -> None:
 # Read Silver tables → register as Spark temp views
 # ---------------------------------------------------------------------------
 
-def load_silver_views(spark: SparkSession) -> None:
+def load_silver_views(spark: SparkSession, tables: list[str] | None = None) -> None:
     """
-    Read all Silver Iceberg tables needed by Gold and register each as a
-    Spark SQL temp view named silver_<table_name>.
+    Read Silver Iceberg tables and register as Spark SQL temp views
+    named silver_<table_name>.
 
-    Called once in runner.py before any Gold transform function runs.
+    Pass `tables` to load only what a specific Gold task needs,
+    avoiding unnecessary reads when tasks run in parallel.
+    If None, loads all Silver tables.
     """
-    silver_tables = [
+    all_tables = [
         "fact_player_stats",
         "fact_series",
         "fact_map_scores",
@@ -74,7 +76,7 @@ def load_silver_views(spark: SparkSession) -> None:
         "dim_teams",
         "dim_players",
     ]
-    for table in silver_tables:
+    for table in (tables or all_tables):
         df = spark.table(f"nessie.silver.{table}")
         df.createOrReplaceTempView(f"silver_{table}")
         log.info("  Loaded view: silver_%s (%d rows)", table, df.count())

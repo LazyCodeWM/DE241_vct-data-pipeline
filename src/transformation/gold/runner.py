@@ -41,78 +41,65 @@ logging.basicConfig(
 log = logging.getLogger("gold_vct_pipeline")
 
 # ---------------------------------------------------------------------------
-# Table registry
-# Format: (table_name, build_fn, partition_cols)
+# Airflow-callable sub-functions (one per Gold task group)
 # ---------------------------------------------------------------------------
 
-# Registered after Silver views are loaded — build_fn receives spark session
-_GOLD_TABLES = [
-    # Players
-    ("player_performance",     build_player_performance,    ("event_id",)),
-    ("player_map_performance", build_player_map_performance, ()),
-    # Agents
-    ("agent_meta",             build_agent_meta,             ("map_name",)),
-    ("agent_player_affinity",  build_agent_player_affinity,  ()),
-    # Teams
-    ("team_standings",         build_team_standings,         ("event_id",)),
-    ("team_map_performance",   build_team_map_performance,   ()),
-    # Matches
-    ("match_summary",          build_match_summary,          ("event_id",)),
-]
+def run_players() -> None:
+    """gold_players task — player_performance, player_map_performance."""
+    log.info("=== gold_players ===")
+    spark = build_spark()
+    ensure_gold_namespace(build_iceberg_catalog())
+    load_silver_views(spark, ["fact_player_stats"])
+    write_gold_table(spark, "player_performance",     build_player_performance(spark),     ("event_id",))
+    write_gold_table(spark, "player_map_performance", build_player_map_performance(spark), ())
+    spark.stop()
+
+
+def run_agents() -> None:
+    """gold_agents task — agent_meta, agent_player_affinity."""
+    log.info("=== gold_agents ===")
+    spark = build_spark()
+    ensure_gold_namespace(build_iceberg_catalog())
+    load_silver_views(spark, ["fact_player_stats", "fact_map_scores"])
+    write_gold_table(spark, "agent_meta",            build_agent_meta(spark),            ("map_name",))
+    write_gold_table(spark, "agent_player_affinity", build_agent_player_affinity(spark), ())
+    spark.stop()
+
+
+def run_teams() -> None:
+    """gold_teams task — team_standings, team_map_performance."""
+    log.info("=== gold_teams ===")
+    spark = build_spark()
+    ensure_gold_namespace(build_iceberg_catalog())
+    load_silver_views(spark, ["fact_series", "fact_map_scores"])
+    write_gold_table(spark, "team_standings",       build_team_standings(spark),       ("event_id",))
+    write_gold_table(spark, "team_map_performance", build_team_map_performance(spark), ())
+    spark.stop()
+
+
+def run_matches() -> None:
+    """gold_matches task — match_summary."""
+    log.info("=== gold_matches ===")
+    spark = build_spark()
+    ensure_gold_namespace(build_iceberg_catalog())
+    load_silver_views(spark, ["fact_series", "fact_map_scores"])
+    write_gold_table(spark, "match_summary", build_match_summary(spark), ("event_id",))
+    spark.stop()
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Full pipeline (CLI / direct run)
 # ---------------------------------------------------------------------------
 
 def run_pipeline() -> None:
     log.info("=" * 60)
-    log.info("Gold Layer Pipeline — VCT Esports")
-    log.info("Namespace : %s", GOLD_NS)
+    log.info("Gold Layer Pipeline — VCT Esports (full run)")
     log.info("=" * 60)
-
-    stats: dict[str, int] = {name: 0 for name, _, _ in _GOLD_TABLES}
-
-    # ── Step 1: Build Spark + catalog ────────────────────────────────────────
-    spark   = build_spark()
-    catalog = build_iceberg_catalog()
-    ensure_gold_namespace(catalog)
-
-    # ── Step 2: Load Silver tables as temp views ──────────────────────────────
-    log.info("Step 1: Loading Silver tables as Spark temp views …")
-    load_silver_views(spark)
-
-    # ── Step 3: Build + write each Gold table ─────────────────────────────────
-    log.info("Step 2: Building and writing Gold tables …")
-
-    for table_name, build_fn, partition_cols in _GOLD_TABLES:
-        try:
-            df = build_fn(spark)
-            stats[table_name] = write_gold_table(spark, table_name, df, partition_cols)
-        except Exception as exc:
-            log.error("  FAILED gold.%s: %s", table_name, exc, exc_info=True)
-
-    spark.stop()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    log.info("=" * 60)
+    run_players()
+    run_agents()
+    run_teams()
+    run_matches()
     log.info("Gold pipeline complete.")
-    log.info("")
-    log.info("  Players")
-    log.info("    player_performance     : %d rows", stats["player_performance"])
-    log.info("    player_map_performance : %d rows", stats["player_map_performance"])
-    log.info("")
-    log.info("  Agents")
-    log.info("    agent_meta             : %d rows", stats["agent_meta"])
-    log.info("    agent_player_affinity  : %d rows", stats["agent_player_affinity"])
-    log.info("")
-    log.info("  Teams")
-    log.info("    team_standings         : %d rows", stats["team_standings"])
-    log.info("    team_map_performance   : %d rows", stats["team_map_performance"])
-    log.info("")
-    log.info("  Matches")
-    log.info("    match_summary          : %d rows", stats["match_summary"])
-    log.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
