@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==8.2.0
+ruff==0.4.4
+ipykernel==6.29.0
