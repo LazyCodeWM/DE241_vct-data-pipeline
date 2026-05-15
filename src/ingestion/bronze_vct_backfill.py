@@ -2,26 +2,36 @@
 bronze_vct_backfill.py
 ======================
 Historical Backfill Ingestion — Bronze Layer
-Medallion Architecture | VCT Partnership Leagues (2023–2026)
+Medallion Architecture | VCT Tier-1 Global/Regional Events (2023–2026)
 
 Responsibilities:
-  - Discovers all VCT-tier events from vlrdevapi.
-  - For every completed match in each event, fetches:
+  - Discovers VCT-tier events from vlrdevapi, keeping ONLY Tier-1
+    Global/Regional tournaments (Masters, Champions, Lock//In, and the
+    four regional leagues: Americas, EMEA, Pacific, China).
+  - For every completed match in each in-scope event, fetches:
       • Series-level metadata  (series.info)
       • Per-map player stats   (series.matches)
   - Validates every record against a Pydantic Data Contract.
   - Streams valid records as JSON directly to MinIO (bronze-vct-data bucket).
   - Routes invalid records to a Quarantine/DLQ path in MinIO.
   - Never writes anything to local disk.
+  - Self-healing: individual match / player-stat failures are logged and
+    skipped without crashing the pipeline.
+
+Event filtering (applied before any nested API calls are made)
+  Blacklist — skip immediately if the name contains (case-insensitive):
+    CHALLENGERS | ASCENSION | GAME CHANGERS | GC | PROMO
+  Whitelist — keep only if the name contains at least one of:
+    PACIFIC | EMEA | AMERICAS | CHINA | MASTERS | CHAMPIONS | LOCK//IN
 
 MinIO path conventions
   bronze-vct-data/
     events/           raw/{event_id}.json
     series/           raw/{match_id}.json
-    player_stats/     raw/{match_id}_{map_index}.json
+    player_stats/     raw/{match_id}_{map_index}_{player_name}.json
     quarantine/       events/{event_id}_{ts}.json
                       series/{match_id}_{ts}.json
-                      player_stats/{match_id}_{map_index}_{ts}.json
+                      player_stats/{match_id}_{map_index}_{player}_{ts}.json
 """
 
 from __future__ import annotations
@@ -39,9 +49,16 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+import httpx
 import vlrdevapi as vlr
 from vlrdevapi.events import EventStatus, EventTier
-from vlrdevapi.exceptions import DataNotFoundError, NetworkError, RateLimitError
+from vlrdevapi.exceptions import (
+    DataNotFoundError,
+    NetworkError,
+    RateLimitError,
+    ScrapingError,
+    VlrdevapiError,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -71,6 +88,36 @@ BACKFILL_END_YEAR:   int = 2026
 REQUEST_DELAY_SECONDS:    float = 1.5   # Between every API call
 RETRY_DELAY_SECONDS:      float = 30.0  # On RateLimitError / transient errors
 MAX_RETRIES:              int   = 3
+
+# ---------------------------------------------------------------------------
+# Tier-1 Event Filter Sets
+#
+# Evaluated case-insensitively against the event name BEFORE any nested
+# API calls are attempted, so we waste zero requests on out-of-scope events.
+#
+# Blacklist takes priority: if ANY blacklist token matches, the event is
+# dropped regardless of whether a whitelist token also matches.
+# ---------------------------------------------------------------------------
+
+# Tournaments that are explicitly out of scope (Tier-2/3, developmental)
+_BLACKLIST_TOKENS: frozenset[str] = frozenset({
+    "CHALLENGERS",
+    "ASCENSION",
+    "GAME CHANGERS",
+    "GC",
+    "PROMO",
+})
+
+# Tournaments that are in scope (Tier-1 global / regional events)
+_WHITELIST_TOKENS: frozenset[str] = frozenset({
+    "PACIFIC",
+    "EMEA",
+    "AMERICAS",
+    "CHINA",
+    "MASTERS",
+    "CHAMPIONS",
+    "LOCK//IN",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -223,29 +270,70 @@ def _upload_quarantine(
 def _call_with_retry(fn, *args, **kwargs) -> Any:
     """
     Call a vlrdevapi function with automatic retry on transient errors.
-    Respects rate-limit signals from the library.
+
+    Retry behaviour by exception type:
+      RateLimitError   → back off for RETRY_DELAY_SECONDS, then retry.
+      NetworkError     → back off and retry; re-raise after MAX_RETRIES.
+      httpx.HTTPError  → treated identically to NetworkError (transport-level
+                         failures that vlrdevapi may not wrap).
+      ScrapingError    → back off and retry; vlr.gg occasionally returns
+                         malformed HTML that clears on a second attempt.
+      VlrdevapiError   → catch-all for any other library error; retry once,
+                         then return None so the caller can skip gracefully.
+      DataNotFoundError → not retried — data simply doesn't exist.
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             result = fn(*args, **kwargs)
             time.sleep(REQUEST_DELAY_SECONDS)
             return result
+
         except RateLimitError:
             log.warning(
                 "Rate limit hit on attempt %d/%d — sleeping %ss …",
                 attempt, MAX_RETRIES, RETRY_DELAY_SECONDS,
             )
             time.sleep(RETRY_DELAY_SECONDS)
-        except NetworkError as exc:
-            log.warning("Network error on attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
+
+        except (NetworkError, httpx.HTTPError) as exc:
+            log.warning(
+                "Network/HTTP error on attempt %d/%d: %s — sleeping %ss …",
+                attempt, MAX_RETRIES, exc, RETRY_DELAY_SECONDS,
+            )
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SECONDS)
             else:
+                # Exhausted retries: propagate so the per-match guard catches it
                 raise
+
+        except ScrapingError as exc:
+            log.warning(
+                "Scraping error on attempt %d/%d: %s — sleeping %ss before retry …",
+                attempt, MAX_RETRIES, exc, RETRY_DELAY_SECONDS,
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
+            else:
+                log.error("ScrapingError persisted after %d attempts: %s", MAX_RETRIES, exc)
+                return None
+
         except DataNotFoundError as exc:
             # Not a transient error — data simply doesn't exist; caller handles it.
             log.debug("DataNotFoundError (non-retried): %s", exc)
             return None
+
+        except VlrdevapiError as exc:
+            # Catch-all for any other library-level error.
+            log.warning(
+                "Unexpected VlrdevapiError on attempt %d/%d: %s",
+                attempt, MAX_RETRIES, exc,
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
+            else:
+                log.error("VlrdevapiError persisted after %d attempts — returning None.", MAX_RETRIES)
+                return None
+
     return None
 
 
@@ -296,22 +384,71 @@ def _ingest_player_stat(
 
 def _is_in_scope(event: vlr.events.ListEvent) -> bool:
     """
-    Return True if the event falls within the backfill year window.
-    We use start_date as the anchor; if it's absent we fall back to the name.
+    Return True only if the event is a Tier-1 VCT event within the backfill
+    year window (BACKFILL_START_YEAR – BACKFILL_END_YEAR).
+
+    Evaluation order (short-circuits as early as possible to minimise wasted
+    API requests downstream):
+
+      1. Year-window check  — drop events outside 2023-2026 immediately.
+      2. Blacklist check    — drop developmental / non-Tier-1 events.
+      3. Whitelist check    — keep only confirmed Tier-1 regional/global events.
+
+    Both token checks are case-insensitive and match on substrings so they
+    are resilient to minor name variations (e.g. "VCT 2024 Americas League"
+    still matches "AMERICAS").
     """
+    # ── 1. Year-window guard ────────────────────────────────────────────────
+    # Prefer the structured start_date; fall back to year digits in the name.
     if event.start_date:
-        return BACKFILL_START_YEAR <= event.start_date.year <= BACKFILL_END_YEAR
-    # Heuristic fallback: check for year digits in the event name
-    for year in range(BACKFILL_START_YEAR, BACKFILL_END_YEAR + 1):
-        if str(year) in event.name:
+        if not (BACKFILL_START_YEAR <= event.start_date.year <= BACKFILL_END_YEAR):
+            return False
+    else:
+        # No date available — scan the name for a valid year token.
+        year_found = any(
+            str(year) in event.name
+            for year in range(BACKFILL_START_YEAR, BACKFILL_END_YEAR + 1)
+        )
+        if not year_found:
+            return False
+
+    # ── 2. Blacklist — drop non-Tier-1 tournaments ─────────────────────────
+    name_upper = event.name.upper()
+    for token in _BLACKLIST_TOKENS:
+        if token in name_upper:
+            log.debug(
+                "Skipping blacklisted event %d '%s' (matched token: '%s').",
+                event.id, event.name, token,
+            )
+            return False
+
+    # ── 3. Whitelist — keep only confirmed Tier-1 events ───────────────────
+    for token in _WHITELIST_TOKENS:
+        if token in name_upper:
             return True
+
+    # Name passed the year window and blacklist but matched nothing on the
+    # whitelist — treat as out-of-scope and log for manual review.
+    log.debug(
+        "Skipping unrecognised event %d '%s' (no whitelist token matched).",
+        event.id, event.name,
+    )
     return False
 
 
 def _process_event_matches(s3: Any, event_id: int, stats: dict) -> None:
     """
-    Fetch all completed matches for *event_id*, then for each match
-    fetch the series-level info and per-map player stats.
+    Fetch all completed matches for *event_id*, then for each match fetch
+    the series-level info and per-map player stats.
+
+    Defensive design — failures are isolated at two granularities:
+      • Per-match:      if series.info or series.matches raises / returns None
+                        for a specific match_id, that match is skipped and
+                        counted in stats["series_missing"]. The loop continues.
+      • Per-player-row: if a single player-stat dict fails Pydantic validation
+                        or triggers an unexpected error, it is quarantined /
+                        logged and the inner loop moves to the next player.
+    The outer event loop in run_backfill() is never affected.
     """
     log.info("  → Fetching match list for event %d …", event_id)
     matches: list[vlr.events.Match] | None = _call_with_retry(
@@ -328,79 +465,140 @@ def _process_event_matches(s3: Any, event_id: int, stats: dict) -> None:
         match_id = match.match_id
         log.info("    Processing match %d …", match_id)
 
-        # ── Series metadata ─────────────────────────────────────────────────
-        series_info: vlr.series.Info | None = _call_with_retry(
-            vlr.series.info, match_id
-        )
-        if series_info is None:
-            log.warning("    series.info returned None for match %d — skipping.", match_id)
+        # ── Series metadata ──────────────────────────────────────────────────
+        # Guard: any exception from the API call or the ingest helper is caught
+        # here so a single bad match never crashes the event-level loop.
+        try:
+            series_info: vlr.series.Info | None = _call_with_retry(
+                vlr.series.info, match_id
+            )
+            if series_info is None:
+                log.warning(
+                    "    series.info returned None for match %d — skipping.", match_id
+                )
+                stats["series_missing"] += 1
+                continue
+
+            team1_data = series_info.teams[0]
+            team2_data = series_info.teams[1]
+            series_raw = {
+                "match_id":    series_info.match_id,
+                "event_name":  series_info.event,
+                "event_phase": series_info.event_phase,
+                "status_note": series_info.status_note,
+                "best_of":     series_info.best_of,
+                "match_date":  series_info.date,
+                "patch":       series_info.patch,
+                "team1": {
+                    "name":         team1_data.name,
+                    "team_id":      team1_data.id,
+                    "short":        team1_data.short,
+                    "country":      team1_data.country,
+                    "series_score": team1_data.score,
+                },
+                "team2": {
+                    "name":         team2_data.name,
+                    "team_id":      team2_data.id,
+                    "short":        team2_data.short,
+                    "country":      team2_data.country,
+                    "series_score": team2_data.score,
+                },
+            }
+            if _ingest_series(s3, series_raw, match_id):
+                stats["series_valid"] += 1
+            else:
+                stats["series_invalid"] += 1
+
+        except (RateLimitError, NetworkError, httpx.HTTPError) as exc:
+            # Transient transport error that exhausted all retries inside
+            # _call_with_retry.  Back off briefly, then continue to the next match.
+            log.error(
+                "    Failed to fetch series.info for match %d (transport): %s — skipping.",
+                match_id, exc,
+            )
+            stats["series_missing"] += 1
+            time.sleep(RETRY_DELAY_SECONDS)
+            continue
+
+        except Exception as exc:  # noqa: BLE001 — intentional broad safety net
+            # Unexpected error (e.g. malformed API response, index error on teams
+            # tuple). Log with full traceback at ERROR level, then skip gracefully.
+            log.exception(
+                "    Unexpected error processing series for match %d — skipping.", match_id
+            )
             stats["series_missing"] += 1
             continue
 
-        team1_data = series_info.teams[0]
-        team2_data = series_info.teams[1]
-        series_raw = {
-            "match_id":    series_info.match_id,
-            "event_name":  series_info.event,
-            "event_phase": series_info.event_phase,
-            "status_note": series_info.status_note,
-            "best_of":     series_info.best_of,
-            "match_date":  series_info.date,
-            "patch":       series_info.patch,
-            "team1": {
-                "name":         team1_data.name,
-                "team_id":      team1_data.id,
-                "short":        team1_data.short,
-                "country":      team1_data.country,
-                "series_score": team1_data.score,
-            },
-            "team2": {
-                "name":         team2_data.name,
-                "team_id":      team2_data.id,
-                "short":        team2_data.short,
-                "country":      team2_data.country,
-                "series_score": team2_data.score,
-            },
-        }
-        if _ingest_series(s3, series_raw, match_id):
-            stats["series_valid"] += 1
-        else:
-            stats["series_invalid"] += 1
-
         # ── Per-map player stats ─────────────────────────────────────────────
-        maps: list[vlr.series.MapPlayers] | None = _call_with_retry(
-            vlr.series.matches, match_id
-        )
-        if not maps:
-            log.debug("    No map data for match %d.", match_id)
+        try:
+            maps: list[vlr.series.MapPlayers] | None = _call_with_retry(
+                vlr.series.matches, match_id
+            )
+            if not maps:
+                log.debug("    No map data for match %d.", match_id)
+                continue
+
+        except (RateLimitError, NetworkError, httpx.HTTPError) as exc:
+            log.error(
+                "    Failed to fetch series.matches for match %d (transport): %s — skipping.",
+                match_id, exc,
+            )
+            time.sleep(RETRY_DELAY_SECONDS)
+            continue
+
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "    Unexpected error fetching map stats for match %d — skipping.", match_id
+            )
             continue
 
         for map_idx, map_data in enumerate(maps):
             for player in map_data.players:
-                stat_raw = {
-                    "match_id":    match_id,
-                    "map_index":   map_idx,
-                    "game_id":     map_data.game_id,
-                    "map_name":    map_data.map_name,
-                    "player_name": player.name,
-                    "player_id":   player.player_id,
-                    "team_short":  player.team_short,
-                    "team_id":     player.team_id,
-                    "agents":      player.agents,
-                    "rating":      player.r,
-                    "acs":         player.acs,
-                    "kills":       player.k,
-                    "deaths":      player.d,
-                    "assists":     player.a,
-                    "kast":        player.kast,
-                    "adr":         player.adr,
-                    "hs_pct":      player.hs_pct,
-                    "fk":          player.fk,
-                    "fd":          player.fd,
-                }
-                if _ingest_player_stat(s3, stat_raw, match_id, map_idx):
-                    stats["player_stats_valid"] += 1
-                else:
+                # ── Per-player guard ─────────────────────────────────────────
+                # A single corrupt player row must never stop the map loop.
+                try:
+                    stat_raw = {
+                        "match_id":    match_id,
+                        "map_index":   map_idx,
+                        "game_id":     map_data.game_id,
+                        "map_name":    map_data.map_name,
+                        "player_name": player.name,
+                        "player_id":   player.player_id,
+                        "team_short":  player.team_short,
+                        "team_id":     player.team_id,
+                        "agents":      player.agents,
+                        "rating":      player.r,
+                        "acs":         player.acs,
+                        "kills":       player.k,
+                        "deaths":      player.d,
+                        "assists":     player.a,
+                        "kast":        player.kast,
+                        "adr":         player.adr,
+                        "hs_pct":      player.hs_pct,
+                        "fk":          player.fk,
+                        "fd":          player.fd,
+                    }
+                    if _ingest_player_stat(s3, stat_raw, match_id, map_idx):
+                        stats["player_stats_valid"] += 1
+                    else:
+                        # ValidationError was caught inside _ingest_player_stat;
+                        # the record was already quarantined.
+                        stats["player_stats_invalid"] += 1
+
+                except ValidationError as exc:
+                    # Pydantic failure not caught by _ingest_player_stat
+                    # (shouldn't normally happen, but belt-and-suspenders).
+                    log.warning(
+                        "    ValidationError for player '%s' match %d map %d: %s",
+                        getattr(player, "name", "unknown"), match_id, map_idx, exc,
+                    )
+                    stats["player_stats_invalid"] += 1
+
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "    Unexpected error for player '%s' match %d map %d — skipping row.",
+                        getattr(player, "name", "unknown"), match_id, map_idx,
+                    )
                     stats["player_stats_invalid"] += 1
 
 
@@ -426,14 +624,15 @@ def run_backfill() -> None:
 
     # Running counters for the final summary
     stats: dict[str, int] = {
-        "events_total":        0,
-        "events_in_scope":     0,
-        "events_valid":        0,
-        "events_invalid":      0,
-        "series_valid":        0,
-        "series_invalid":      0,
-        "series_missing":      0,
-        "player_stats_valid":  0,
+        "events_total":         0,
+        "events_skipped":       0,   # filtered out by _is_in_scope (blacklist/whitelist/year)
+        "events_in_scope":      0,
+        "events_valid":         0,
+        "events_invalid":       0,
+        "series_valid":         0,
+        "series_invalid":       0,
+        "series_missing":       0,
+        "player_stats_valid":   0,
         "player_stats_invalid": 0,
     }
 
@@ -456,20 +655,28 @@ def run_backfill() -> None:
         log.info("  Page %d: %d events returned.", page, len(page_events))
 
         in_scope_this_page = [e for e in page_events if _is_in_scope(e)]
+        skipped_this_page  = len(page_events) - len(in_scope_this_page)
+        stats["events_skipped"]  += skipped_this_page
+        stats["events_in_scope"] += len(in_scope_this_page)
 
-        # If none of the events on this page are in scope, we may have gone
-        # past our window — stop early only if all events pre-date 2023.
-        all_too_old = all(
-            e.start_date is not None and e.start_date.year < BACKFILL_START_YEAR
-            for e in page_events
-            if e.start_date
-        ) and len(page_events) == len([e for e in page_events if e.start_date])
+        if skipped_this_page:
+            log.info(
+                "  Page %d: %d event(s) filtered out by scope rules.",
+                page, skipped_this_page,
+            )
 
+        # Early-exit: stop paginating once every event on the page pre-dates
+        # our window AND none passed the scope filter.  This prevents scanning
+        # the full historical catalogue on repeated runs.
+        events_with_dates = [e for e in page_events if e.start_date]
+        all_too_old = (
+            bool(events_with_dates)
+            and len(events_with_dates) == len(page_events)
+            and all(e.start_date.year < BACKFILL_START_YEAR for e in events_with_dates)
+        )
         if not in_scope_this_page and all_too_old:
             log.info("All remaining events pre-date %d — stopping.", BACKFILL_START_YEAR)
             break
-
-        stats["events_in_scope"] += len(in_scope_this_page)
 
         for event in in_scope_this_page:
             log.info("Processing event %d: %s (%s)", event.id, event.name, event.status)
@@ -499,6 +706,7 @@ def run_backfill() -> None:
     log.info("=" * 60)
     log.info("Backfill complete.")
     log.info("  Events     total      : %d", stats["events_total"])
+    log.info("  Events     skipped    : %d  (blacklist / whitelist / year)", stats["events_skipped"])
     log.info("  Events     in scope   : %d", stats["events_in_scope"])
     log.info("  Events     valid      : %d", stats["events_valid"])
     log.info("  Events     quarantined: %d", stats["events_invalid"])
