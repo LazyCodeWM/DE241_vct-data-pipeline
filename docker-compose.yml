@@ -27,8 +27,33 @@ services:
       /bin/sh -c "
         mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} &&
         mc mb --ignore-existing local/bronze-vct-data &&
-        echo 'Bucket bronze-vct-data ready.'
+        mc mb --ignore-existing local/silver-vct-data &&
+        echo 'Buckets ready.'
       "
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: nessie
+    ports:
+      - "19120:19120"
+    environment:
+      # Iceberg REST catalog — warehouse backed by MinIO silver bucket
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://silver-vct-data/
+      # S3 / MinIO settings (host = service name inside Docker network)
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://minio:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY_NAME: ${MINIO_ACCESS_KEY}
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY_SECRET: ${MINIO_SECRET_KEY}
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:19120/api/v1/config || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
 volumes:
   minio_data:
