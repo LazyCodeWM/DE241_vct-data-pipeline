@@ -7,19 +7,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
 
-# Set JAVA_HOME dynamically (path differs between amd64 and arm64)
+# Set JAVA_HOME via symlink — works on both amd64 and arm64
 RUN JAVA_PATH=$(readlink -f /usr/bin/java | sed 's|/bin/java||') && \
-    echo "JAVA_HOME=${JAVA_PATH}" >> /etc/environment && \
-    echo "export JAVA_HOME=${JAVA_PATH}" > /etc/profile.d/java.sh && \
-    echo "export PATH=\${JAVA_HOME}/bin:\${PATH}" >> /etc/profile.d/java.sh
+    ln -sfn "$JAVA_PATH" /usr/lib/jvm/java-17-current
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/java-17-current
 ENV PATH=$JAVA_HOME/bin:$PATH
 
 USER airflow
 
 # Install pipeline dependencies (airflow already in base image)
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --timeout 300 --retries 5 \
     python-dotenv==1.0.0 \
     vlrdevapi \
     pydantic==2.7.0 \

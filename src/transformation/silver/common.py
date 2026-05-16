@@ -99,7 +99,7 @@ def read_bronze_prefix(s3: Any, prefix: str) -> pl.DataFrame:
                 records.append(data)
 
     log.info("  [%s] fetched %d records", prefix, len(records))
-    return pl.DataFrame(records) if records else pl.DataFrame()
+    return pl.DataFrame(records, infer_schema_length=None) if records else pl.DataFrame()
 
 
 # ---------------------------------------------------------------------------

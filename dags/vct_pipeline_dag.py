@@ -33,7 +33,16 @@ Catchup  : False
 
 from __future__ import annotations
 
-from datetime import datetime
+import os
+import sys
+
+# Ensure project root (/opt/airflow) is on sys.path so 'src' is importable.
+# DAG lives at /opt/airflow/dags/vct_pipeline_dag.py → parent = /opt/airflow
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
 from airflow.operators.empty import EmptyOperator
@@ -54,44 +63,44 @@ def vct_pipeline():
     end   = EmptyOperator(task_id="end")
 
     # ── Bronze ────────────────────────────────────────────────────────────────
-    @task(task_id="bronze_ingestion", retries=2, retry_delay_seconds=60)
+    @task(task_id="bronze_ingestion", retries=2, retry_delay=timedelta(seconds=60))
     def bronze_ingestion() -> None:
         from src.ingestion.bronze_vct_backfill import run_backfill
         run_backfill()
 
     # ── Silver ────────────────────────────────────────────────────────────────
-    @task(task_id="silver_dims", retries=1, retry_delay_seconds=30)
+    @task(task_id="silver_dims", retries=1, retry_delay=timedelta(seconds=30))
     def silver_dims() -> None:
         from src.transformation.silver.runner import run_dims
         run_dims()
 
-    @task(task_id="silver_facts_meta", retries=1, retry_delay_seconds=30)
+    @task(task_id="silver_facts_meta", retries=1, retry_delay=timedelta(seconds=30))
     def silver_facts_meta() -> None:
         from src.transformation.silver.runner import run_facts_meta
         run_facts_meta()
 
-    @task(task_id="silver_facts_match", retries=1, retry_delay_seconds=30)
+    @task(task_id="silver_facts_match", retries=1, retry_delay=timedelta(seconds=30))
     def silver_facts_match() -> None:
         from src.transformation.silver.runner import run_facts_match
         run_facts_match()
 
     # ── Gold ──────────────────────────────────────────────────────────────────
-    @task(task_id="gold_players", retries=1, retry_delay_seconds=30)
+    @task(task_id="gold_players", retries=1, retry_delay=timedelta(seconds=30))
     def gold_players() -> None:
         from src.transformation.gold.runner import run_players
         run_players()
 
-    @task(task_id="gold_agents", retries=1, retry_delay_seconds=30)
+    @task(task_id="gold_agents", retries=1, retry_delay=timedelta(seconds=30))
     def gold_agents() -> None:
         from src.transformation.gold.runner import run_agents
         run_agents()
 
-    @task(task_id="gold_teams", retries=1, retry_delay_seconds=30)
+    @task(task_id="gold_teams", retries=1, retry_delay=timedelta(seconds=30))
     def gold_teams() -> None:
         from src.transformation.gold.runner import run_teams
         run_teams()
 
-    @task(task_id="gold_matches", retries=1, retry_delay_seconds=30)
+    @task(task_id="gold_matches", retries=1, retry_delay=timedelta(seconds=30))
     def gold_matches() -> None:
         from src.transformation.gold.runner import run_matches
         run_matches()

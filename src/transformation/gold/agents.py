@@ -35,21 +35,31 @@ def build_agent_meta(spark: SparkSession) -> DataFrame:
     return spark.sql("""
         WITH exploded AS (
             SELECT
+                fps.match_id,
+                fps.game_id,
                 fps.map_name,
-                agent,
+                fps.team_id,
                 fps.r_rating,
                 fps.acs,
-                fps.team_id,
-                CASE
-                    WHEN fps.team_id = fms.team1_id THEN fms.team1_is_winner
-                    WHEN fps.team_id = fms.team2_id THEN fms.team2_is_winner
-                    ELSE NULL
-                END AS is_winner
+                agent
             FROM silver_fact_player_stats fps
             LATERAL VIEW EXPLODE(fps.agents) AS agent
+        ),
+        enriched AS (
+            SELECT
+                e.map_name,
+                e.agent,
+                e.r_rating,
+                e.acs,
+                CASE
+                    WHEN e.team_id = fms.team1_id THEN fms.team1_is_winner
+                    WHEN e.team_id = fms.team2_id THEN fms.team2_is_winner
+                    ELSE NULL
+                END AS is_winner
+            FROM exploded e
             LEFT JOIN silver_fact_map_scores fms
-                ON fps.match_id = fms.match_id
-               AND fps.game_id  = fms.game_id
+                ON e.match_id = fms.match_id
+               AND e.game_id  = fms.game_id
         )
         SELECT
             map_name,
@@ -60,7 +70,7 @@ def build_agent_meta(spark: SparkSession) -> DataFrame:
             ROUND(
                 AVG(CASE WHEN is_winner = true THEN 1.0 ELSE 0.0 END)
             , 3)                                               AS win_rate
-        FROM exploded
+        FROM enriched
         WHERE map_name IS NOT NULL
           AND agent    IS NOT NULL
         GROUP BY map_name, agent
