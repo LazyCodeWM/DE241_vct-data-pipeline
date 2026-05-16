@@ -8,6 +8,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    PYTHONPATH: /opt/airflow
     # Pipeline env — point to Docker service names (override local .env)
     MINIO_ENDPOINT: http://minio:9000
     MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}

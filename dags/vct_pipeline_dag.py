@@ -33,6 +33,15 @@ Catchup  : False
 
 from __future__ import annotations
 
+import os
+import sys
+
+# Ensure project root (/opt/airflow) is on sys.path so 'src' is importable.
+# DAG lives at /opt/airflow/dags/vct_pipeline_dag.py → parent = /opt/airflow
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task

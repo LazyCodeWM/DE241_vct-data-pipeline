@@ -725,6 +725,15 @@ def run_backfill() -> None:
     s3 = _build_s3_client()
     _ensure_bucket(s3, BUCKET_NAME)
 
+    # ── Idempotency guard: skip entire backfill if data already exists ────────
+    # Once Bronze is ingested, the DAG should proceed straight to Silver/Gold
+    # without re-scanning vlr.gg. Check for any existing series file as proxy.
+    probe = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="series/raw/", MaxKeys=1)
+    if probe.get("KeyCount", 0) > 0:
+        log.info("Bronze data already present in MinIO (series/raw/ non-empty) — skipping backfill.")
+        log.info("=" * 60)
+        return
+
     stats: dict[str, int] = {
         "events_total":             0,
         "events_skipped":           0,
