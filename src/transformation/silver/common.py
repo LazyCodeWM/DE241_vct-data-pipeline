@@ -27,6 +27,11 @@ from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col as spark_col
+from pyspark.sql.types import (
+    ArrayType, BooleanType, DateType, DoubleType, FloatType,
+    IntegerType, LongType, StringType, StructField, StructType,
+    TimestampType,
+)
 
 load_dotenv()
 
@@ -101,6 +106,35 @@ def read_bronze_prefix(s3: Any, prefix: str) -> pl.DataFrame:
 # SparkSession
 # ---------------------------------------------------------------------------
 
+_JAVA17_HOME = "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
+
+
+def _ensure_java17() -> None:
+    """
+    PySpark 3.5 / Hadoop 3.3.x calls Subject.getSubject() which throws
+    UnsupportedOperationException on Java 21+.  Force Java 17 when the
+    active JDK is too new, before PySpark spawns its gateway JVM.
+    """
+    import subprocess
+    result = subprocess.run(
+        ["java", "-version"], capture_output=True, text=True
+    )
+    version_line = result.stderr or result.stdout
+    # version string looks like: openjdk version "25.0.2" ...
+    major = 0
+    for part in version_line.split():
+        if part.startswith('"'):
+            try:
+                major = int(part.strip('"').split(".")[0])
+            except ValueError:
+                pass
+            break
+    if major >= 21 and os.path.isdir(_JAVA17_HOME):
+        log.info("Java %d detected — forcing JAVA_HOME to Java 17 for Spark.", major)
+        os.environ["JAVA_HOME"] = _JAVA17_HOME
+        os.environ["PATH"] = f"{_JAVA17_HOME}/bin:{os.environ.get('PATH', '')}"
+
+
 def build_spark() -> SparkSession:
     """
     SparkSession configured for:
@@ -108,6 +142,8 @@ def build_spark() -> SparkSession:
       - S3A filesystem pointing at local MinIO (path-style access)
       - Arrow-accelerated pandas bridge for Spark ↔ Polars conversion
     """
+    _ensure_java17()
+
     minio_host = MINIO_ENDPOINT.replace("https://", "").replace("http://", "")
 
     return (
@@ -179,6 +215,49 @@ def ensure_namespace(catalog: Any, namespace: str = SILVER_NS) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Polars → Spark schema bridge
+# ---------------------------------------------------------------------------
+
+def _pl_to_spark_type(dtype: pl.PolarsDataType):
+    if dtype == pl.Int64:
+        return LongType()
+    if dtype in (pl.Int32, pl.Int16, pl.Int8, pl.UInt32, pl.UInt16, pl.UInt8):
+        return IntegerType()
+    if dtype == pl.Float64:
+        return DoubleType()
+    if dtype == pl.Float32:
+        return FloatType()
+    if dtype in (pl.Utf8, pl.Categorical):
+        return StringType()
+    if dtype == pl.Boolean:
+        return BooleanType()
+    if dtype == pl.Date:
+        return DateType()
+    if isinstance(dtype, pl.Datetime):
+        return TimestampType()
+    if isinstance(dtype, pl.List):
+        return ArrayType(_pl_to_spark_type(dtype.inner), containsNull=True)
+    return StringType()  # Null and unknown types → String
+
+
+def _polars_to_spark_df(spark: SparkSession, df: pl.DataFrame):
+    """Convert Polars DataFrame to Spark, providing an explicit schema so Spark
+    doesn't have to infer types from potentially ambiguous pandas dtypes."""
+    schema = StructType([
+        StructField(c, _pl_to_spark_type(t), nullable=True)
+        for c, t in zip(df.columns, df.dtypes)
+    ])
+    pdf = df.to_pandas()
+    # Pandas encodes Polars List columns as numpy arrays; Spark needs Python lists.
+    for col_name, dtype in zip(df.columns, df.dtypes):
+        if isinstance(dtype, pl.List):
+            pdf[col_name] = pdf[col_name].apply(
+                lambda x: x.tolist() if x is not None else None
+            )
+    return spark.createDataFrame(pdf, schema=schema)
+
+
+# ---------------------------------------------------------------------------
 # Iceberg write
 # ---------------------------------------------------------------------------
 
@@ -193,12 +272,45 @@ def write_iceberg_table(
     createOrReplace() makes every run fully idempotent.
     Returns number of rows written.
     """
+    from py4j.protocol import Py4JJavaError
+
+    if df.is_empty():
+        log.info("  silver.%-30s skipped  : 0 rows (empty source)", table_name)
+        return 0
+
     full_name = f"nessie.{SILVER_NS}.{table_name}"
-    spark_df  = spark.createDataFrame(df.to_pandas())
-    writer    = spark_df.writeTo(full_name)
-    if partition_cols:
-        writer = writer.partitionedBy(*[spark_col(c) for c in partition_cols])
-    writer.createOrReplace()
+    spark_df  = _polars_to_spark_df(spark, df)
+
+    def _write(replace: bool) -> None:
+        writer = spark_df.writeTo(full_name)
+        if partition_cols:
+            writer = writer.partitionedBy(*[spark_col(c) for c in partition_cols])
+        if replace:
+            writer.createOrReplace()
+        else:
+            writer.create()
+
+    try:
+        _write(replace=True)
+    except Py4JJavaError as exc:
+        # Stale Nessie catalog entry whose S3 metadata files were deleted.
+        # Spark's DROP TABLE also reads S3 metadata, so use the PyIceberg
+        # REST catalog which removes the Nessie commit ref without touching S3.
+        if "NotFoundException" in str(exc) or "FileNotFoundException" in str(exc):
+            log.warning(
+                "  silver.%s — stale metadata detected; purging via PyIceberg and recreating.",
+                table_name,
+            )
+            from pyiceberg.exceptions import NoSuchTableError
+            cat = build_iceberg_catalog()
+            try:
+                cat.drop_table((SILVER_NS, table_name))
+            except NoSuchTableError:
+                pass
+            _write(replace=False)
+        else:
+            raise
+
     log.info("  silver.%-30s written : %d rows", table_name, len(df))
     return len(df)
 

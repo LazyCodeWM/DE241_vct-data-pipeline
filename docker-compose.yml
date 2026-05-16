@@ -1,4 +1,34 @@
+x-airflow-common: &airflow-common
+  build: .
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Pipeline env — point to Docker service names (override local .env)
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+    MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    NESSIE_URI: http://nessie:19120/api/v1
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+    nessie:
+      condition: service_healthy
+
 services:
+
+  # ── Storage ──────────────────────────────────────────────────────────────────
+
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -28,8 +58,11 @@ services:
         mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} &&
         mc mb --ignore-existing local/bronze-vct-data &&
         mc mb --ignore-existing local/silver-vct-data &&
+        mc mb --ignore-existing local/gold-vct-data &&
         echo 'Buckets ready.'
       "
+
+  # ── Catalog ───────────────────────────────────────────────────────────────────
 
   nessie:
     image: ghcr.io/projectnessie/nessie:latest
@@ -37,10 +70,8 @@ services:
     ports:
       - "19120:19120"
     environment:
-      # Iceberg REST catalog — warehouse backed by MinIO silver bucket
       NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
       NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://silver-vct-data/
-      # S3 / MinIO settings (host = service name inside Docker network)
       NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://minio:9000
       NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
       NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
@@ -55,5 +86,68 @@ services:
       timeout: 5s
       retries: 6
 
+  # ── Airflow metadata DB ───────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Airflow bootstrap (runs once) ─────────────────────────────────────────────
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+    restart: "no"
+
+  # ── Airflow services ──────────────────────────────────────────────────────────
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
 volumes:
   minio_data:
+  postgres_data:
+  airflow_logs:
