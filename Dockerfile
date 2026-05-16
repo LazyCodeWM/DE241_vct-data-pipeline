@@ -19,7 +19,7 @@ ENV PATH=$JAVA_HOME/bin:$PATH
 USER airflow
 
 # Install pipeline dependencies (airflow already in base image)
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --timeout 300 --retries 5 \
     python-dotenv==1.0.0 \
     vlrdevapi \
     pydantic==2.7.0 \
