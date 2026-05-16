@@ -3,87 +3,118 @@ vct_pipeline_dag.py
 ===================
 Airflow DAG — VCT Data Pipeline (Medallion Architecture)
 
-Orchestrates the full Bronze → Silver → Gold pipeline.
+Task graph:
 
-Schedule : None  (manual trigger only — designed for on-demand backfill)
+                        [start]
+                           │
+                           ▼
+                  [bronze_ingestion]
+                     │         │
+                     ▼         ▼
+            [silver_dims]   [silver_facts_meta]
+                     │         │
+                     ▼         │
+           [silver_facts_match]│
+                     │         │
+                     └────┬────┘
+                          ▼
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼               ▼
+   [gold_players]   [gold_agents]   [gold_teams]   [gold_matches]
+          │               │               │               │
+          └───────────────┴───────────────┴───────────────┘
+                          │
+                          ▼
+                        [end]
+
+Schedule : None  (manual trigger)
 Catchup  : False
-
-Task dependency:
-    bronze_ingestion >> silver_transform >> gold_transform
-
-Notes:
-  - bronze_ingestion  : fully implemented, runs bronze_vct_backfill.run_backfill()
-  - silver_transform  : fully implemented, runs silver.runner.run_pipeline()
-  - gold_transform    : placeholder — will be wired when feature/gold-layer is merged
 """
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 
 from airflow.decorators import dag, task
-
-log = logging.getLogger(__name__)
+from airflow.operators.empty import EmptyOperator
 
 
 @dag(
     dag_id="vct_pipeline",
     description="VCT Medallion Pipeline: Bronze → Silver → Gold",
-    schedule=None,           # manual trigger; change to e.g. "@daily" for scheduled runs
+    schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    max_active_runs=1,       # prevent concurrent runs clobbering MinIO writes
+    max_active_runs=1,
     tags=["vct", "medallion", "bronze", "silver", "gold"],
 )
 def vct_pipeline():
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Task 1 — Bronze Ingestion
-    # Discovers Tier-1 VCT events from vlr.gg and writes raw JSON to MinIO.
-    # ──────────────────────────────────────────────────────────────────────────
-    @task(
-        task_id="bronze_ingestion",
-        retries=2,
-        retry_delay_seconds=60,
-    )
+    start = EmptyOperator(task_id="start")
+    end   = EmptyOperator(task_id="end")
+
+    # ── Bronze ────────────────────────────────────────────────────────────────
+    @task(task_id="bronze_ingestion", retries=2, retry_delay_seconds=60)
     def bronze_ingestion() -> None:
         from src.ingestion.bronze_vct_backfill import run_backfill
         run_backfill()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Task 2 — Silver Transformation
-    # Reads Bronze JSON, cleans + enriches, writes 11 Iceberg tables to Nessie.
-    # ──────────────────────────────────────────────────────────────────────────
-    @task(
-        task_id="silver_transform",
-        retries=1,
-        retry_delay_seconds=30,
-    )
-    def silver_transform() -> None:
-        from src.transformation.silver.runner import run_pipeline
-        run_pipeline()
+    # ── Silver ────────────────────────────────────────────────────────────────
+    @task(task_id="silver_dims", retries=1, retry_delay_seconds=30)
+    def silver_dims() -> None:
+        from src.transformation.silver.runner import run_dims
+        run_dims()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Task 3 — Gold Transformation  (placeholder)
-    # Will aggregate Silver tables into 7 analytics-ready Gold tables.
-    # TODO: wire up when feature/gold-layer is merged into develop.
-    # ──────────────────────────────────────────────────────────────────────────
-    @task(
-        task_id="gold_transform",
-        retries=1,
-        retry_delay_seconds=30,
-    )
-    def gold_transform() -> None:
-        log.warning(
-            "gold_transform is a placeholder — "
-            "feature/gold-layer has not been merged yet. "
-            "Skipping Gold layer."
-        )
+    @task(task_id="silver_facts_meta", retries=1, retry_delay_seconds=30)
+    def silver_facts_meta() -> None:
+        from src.transformation.silver.runner import run_facts_meta
+        run_facts_meta()
 
-    # ── Dependency chain ──────────────────────────────────────────────────────
-    bronze_ingestion() >> silver_transform() >> gold_transform()
+    @task(task_id="silver_facts_match", retries=1, retry_delay_seconds=30)
+    def silver_facts_match() -> None:
+        from src.transformation.silver.runner import run_facts_match
+        run_facts_match()
+
+    # ── Gold ──────────────────────────────────────────────────────────────────
+    @task(task_id="gold_players", retries=1, retry_delay_seconds=30)
+    def gold_players() -> None:
+        from src.transformation.gold.runner import run_players
+        run_players()
+
+    @task(task_id="gold_agents", retries=1, retry_delay_seconds=30)
+    def gold_agents() -> None:
+        from src.transformation.gold.runner import run_agents
+        run_agents()
+
+    @task(task_id="gold_teams", retries=1, retry_delay_seconds=30)
+    def gold_teams() -> None:
+        from src.transformation.gold.runner import run_teams
+        run_teams()
+
+    @task(task_id="gold_matches", retries=1, retry_delay_seconds=30)
+    def gold_matches() -> None:
+        from src.transformation.gold.runner import run_matches
+        run_matches()
+
+    # ── Dependencies ──────────────────────────────────────────────────────────
+    t_bronze       = bronze_ingestion()
+    t_dims         = silver_dims()
+    t_facts_meta   = silver_facts_meta()
+    t_facts_match  = silver_facts_match()
+    t_players      = gold_players()
+    t_agents       = gold_agents()
+    t_teams        = gold_teams()
+    t_matches      = gold_matches()
+
+    all_gold = [t_players, t_agents, t_teams, t_matches]
+
+    start >> t_bronze >> [t_dims, t_facts_meta]
+    t_dims >> t_facts_match
+    [t_dims, t_facts_match, t_facts_meta] >> t_players
+    [t_dims, t_facts_match, t_facts_meta] >> t_agents
+    [t_dims, t_facts_match, t_facts_meta] >> t_teams
+    [t_dims, t_facts_match, t_facts_meta] >> t_matches
+    all_gold >> end
 
 
-# Instantiate the DAG
 vct_pipeline()

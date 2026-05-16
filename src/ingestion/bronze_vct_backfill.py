@@ -354,6 +354,14 @@ def _upload_quarantine(s3: Any, record_type: str, key_stem: str, payload: dict |
     _upload_json(s3, BUCKET_NAME, key, quarantine_payload)
     log.warning("Quarantined record → s3://%s/%s", BUCKET_NAME, key)
 
+def _key_exists(s3: Any, bucket: str, key: str) -> bool:
+    """Return True if the S3 key already exists (idempotency check)."""
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError:
+        return False
+
 # ---------------------------------------------------------------------------
 # Retry wrapper
 # ---------------------------------------------------------------------------
@@ -436,7 +444,13 @@ def _process_event_matches(s3: Any, event_id: int, stats: dict) -> None:
     completed_matches = [m for m in matches if m.status.lower() == "completed"]
     for match in completed_matches:
         match_id = match.match_id
-        
+
+        # ── Idempotency: skip if already ingested ────────────────────────────
+        if _key_exists(s3, BUCKET_NAME, f"series/raw/{match_id}.json"):
+            log.debug("Skipping already-ingested match %d", match_id)
+            stats["series_skipped"] = stats.get("series_skipped", 0) + 1
+            continue
+
         # ── Series metadata ──────────────────────────────────────────────────
         try:
             series_info: vlr.series.Info | None = _call_with_retry(vlr.series.info, match_id)
@@ -513,12 +527,12 @@ def _process_event_matches(s3: Any, event_id: int, stats: dict) -> None:
                             "agents": player.agents, "rating": player.r, "acs": player.acs, "kills": player.k, "deaths": player.d, "assists": player.a,
                             "kast": player.kast, "adr": player.adr, "hs_pct": player.hs_pct, "fk": player.fk, "fd": player.fd,
                         }
-                        key_stem = f"{match_id}_{map_index}_{player.name}"
+                        key_stem = f"{match_id}_{map_idx}_{player.name}"
                         validated_stat = BronzePlayerStatRecord(**stat_raw)
                         _upload_valid(s3, "player_stats", key_stem, validated_stat.model_dump())
                         stats["player_stats_valid"] += 1
                     except ValidationError as exc:
-                        _upload_quarantine(s3, "player_stats", f"{match_id}_{map_index}_unknown", stat_raw, exc.json())
+                        _upload_quarantine(s3, "player_stats", f"{match_id}_{map_idx}_unknown", stat_raw, exc.json())
                         stats["player_stats_invalid"] += 1
                     except Exception:
                         pass
@@ -535,10 +549,10 @@ def _process_event_matches(s3: Any, event_id: int, stats: dict) -> None:
                             "team2_score": getattr(t2, "score", None), "team2_attacker_rounds": getattr(t2, "attacker_rounds", None), "team2_defender_rounds": getattr(t2, "defender_rounds", None), "team2_is_winner": getattr(t2, "is_winner", None),
                         }
                         val_score = BronzeMapScoreRecord(**score_raw)
-                        _upload_valid(s3, "map_scores", f"{match_id}_{map_index}", val_score.model_dump())
+                        _upload_valid(s3, "map_scores", f"{match_id}_{map_idx}", val_score.model_dump())
                         stats["map_scores_valid"] += 1
                     except ValidationError as exc:
-                        _upload_quarantine(s3, "map_scores", f"{match_id}_{map_index}", score_raw, exc.json())
+                        _upload_quarantine(s3, "map_scores", f"{match_id}_{map_idx}", score_raw, exc.json())
                         stats["map_scores_invalid"] += 1
                     except Exception: pass
 
@@ -554,10 +568,10 @@ def _process_event_matches(s3: Any, event_id: int, stats: dict) -> None:
                                 "winner_team_id": getattr(rnd, "winner_team_id", None), "winner_team_short": getattr(rnd, "winner_team_short", None), "winner_team_name": getattr(rnd, "winner_team_name", None),
                             }
                             val_rr = BronzeRoundResultRecord(**rr_raw)
-                            _upload_valid(s3, "round_results", f"{match_id}_{map_index}_{r_num}", val_rr.model_dump())
+                            _upload_valid(s3, "round_results", f"{match_id}_{map_idx}_{r_num}", val_rr.model_dump())
                             stats["round_results_valid"] += 1
                         except ValidationError as exc:
-                            _upload_quarantine(s3, "round_results", f"{match_id}_{map_index}_unknown", rr_raw, exc.json())
+                            _upload_quarantine(s3, "round_results", f"{match_id}_{map_idx}_unknown", rr_raw, exc.json())
                             stats["round_results_invalid"] += 1
                         except Exception: pass
 
@@ -589,6 +603,11 @@ def _process_event_meta(s3: Any, event_id: int, stats: dict) -> None:
 
     # ── Iterating Collected Teams ────────────────────────────────────────────
     for team_id in stats.get("unique_teams", set()):
+        # Skip entire team block if team_info already ingested
+        if _key_exists(s3, BUCKET_NAME, f"team_info/raw/{team_id}.json"):
+            log.debug("Skipping already-ingested team %d", team_id)
+            continue
+
         # 3b: Team Info
         try:
             t_info = _call_with_retry(vlr.teams.info, team_id)
@@ -660,6 +679,11 @@ def _process_event_meta(s3: Any, event_id: int, stats: dict) -> None:
 
     # ── Iterating Collected Players ──────────────────────────────────────────
     for p_id in stats.get("unique_players", set()):
+        # Skip entire player block if profile already ingested
+        if _key_exists(s3, BUCKET_NAME, f"player_profiles/raw/{p_id}.json"):
+            log.debug("Skipping already-ingested player %d", p_id)
+            continue
+
         # 3c: Player Profiles
         try:
             prof = _call_with_retry(vlr.players.profile, p_id)
